@@ -1,0 +1,765 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Atualizar Planilha de Ordens de Serviço em Aberto</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<style>
+  :root {
+    --bg: #f4f6f8;
+    --card: #ffffff;
+    --border: #d8dee4;
+    --text: #1f2933;
+    --muted: #52606d;
+    --accent: #2563eb;
+    --accent-hover: #1d4ed8;
+    --warn-bg: #fff8e1;
+    --warn-border: #f0c419;
+    --error-bg: #fdecea;
+    --error-border: #e74c3c;
+    --ok-bg: #eafaf1;
+    --ok-border: #27ae60;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px;
+    font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  .container { max-width: 880px; margin: 0 auto; }
+  h1 { font-size: 1.5rem; margin-bottom: 4px; }
+  p.subtitle { color: var(--muted); margin-top: 0; margin-bottom: 24px; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px 24px;
+    margin-bottom: 20px;
+  }
+  .field { margin-bottom: 16px; }
+  label { display: block; font-weight: 600; margin-bottom: 6px; }
+  input[type=file] {
+    display: block;
+    width: 100%;
+    padding: 10px;
+    border: 1px dashed var(--border);
+    border-radius: 8px;
+    background: #fafbfc;
+  }
+  .file-hint { font-size: 0.85rem; color: var(--muted); margin-top: 4px; }
+  button {
+    background: var(--accent);
+    color: white;
+    border: none;
+    padding: 12px 20px;
+    border-radius: 8px;
+    font-size: 1rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:hover { background: var(--accent-hover); }
+  button:disabled { background: #a9b4bf; cursor: not-allowed; }
+  button.secondary { background: #27ae60; }
+  button.secondary:hover { background: #219150; }
+  #status { margin-top: 12px; font-size: 0.9rem; color: var(--muted); min-height: 1.2em; }
+  .box { border-radius: 8px; padding: 14px 16px; margin-top: 14px; }
+  .box.error { background: var(--error-bg); border: 1px solid var(--error-border); color: #7a1f16; }
+  .box.warn { background: var(--warn-bg); border: 1px solid var(--warn-border); color: #6b5300; }
+  .box.ok { background: var(--ok-bg); border: 1px solid var(--ok-border); }
+  #summary p { margin: 6px 0; }
+  #summary ul { margin: 6px 0; padding-left: 20px; }
+  #summary code { background: #eef2f6; padding: 1px 5px; border-radius: 4px; }
+  .actions { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .hidden { display: none !important; }
+  footer { color: var(--muted); font-size: 0.8rem; margin-top: 30px; text-align: center; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Atualizar Planilha de Ordens de Serviço em Aberto</h1>
+  <p class="subtitle">Ferramenta 100% local: nada é enviado a nenhum servidor. Selecione o PDF diário da Unigráfica e a planilha .xlsx atual para mesclar as OS novas sem perder o que já foi preenchido manualmente.</p>
+
+  <div class="card">
+    <div class="field">
+      <label for="pdfInput">1. Relatório PDF do dia ("Ordens de serviço em aberto...")</label>
+      <input type="file" id="pdfInput" accept="application/pdf">
+      <div class="file-hint">Página(s) do relatório "Unigráfica - Ordens de serviço em aberto".</div>
+    </div>
+    <div class="field">
+      <label for="xlsxInput">2. Planilha .xlsx atual (aba "OS em Aberto")</label>
+      <input type="file" id="xlsxInput" accept=".xlsx">
+      <div class="file-hint">A planilha original não é alterada; um novo arquivo "_atualizada.xlsx" é gerado.</div>
+    </div>
+    <div class="actions">
+      <button id="processBtn">Processar e Gerar Planilha Atualizada</button>
+      <button id="downloadBtn" class="secondary hidden">Baixar planilha atualizada</button>
+    </div>
+    <div id="status"></div>
+  </div>
+
+  <div id="resultCard" class="card hidden">
+    <h2 style="margin-top:0;">Resumo</h2>
+    <div id="summary"></div>
+  </div>
+</div>
+<footer>Processamento inteiramente no navegador. Nenhum arquivo é enviado para fora do seu computador.</footer>
+
+<script>
+'use strict';
+pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+/* ----------------------------------------------------------------------
+ * Utilidades gerais
+ * -------------------------------------------------------------------- */
+function normalize(s) {
+  return String(s || '')
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .toLowerCase();
+}
+
+function parseBrazilianNumber(text) {
+  if (!text) return 0;
+  const t = String(text).trim().replace(/\./g, '').replace(',', '.');
+  const n = parseFloat(t);
+  return isNaN(n) ? 0 : n;
+}
+
+function escapeXml(str) {
+  return String(str == null ? '' : str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
+/* ----------------------------------------------------------------------
+ * Extração do PDF
+ * ------------------------------------------------------------------
+ * Problema 1 (sublinhado "_______" sobreposto ao Nome Fantasia): itens de
+ * texto cujo conteúdo é só "_" são descartados ANTES de agrupar por linha,
+ * evitando que fiquem intercalados caractere a caractere com o Fantasia.
+ *
+ * Problema 2 (Descrição do serviço invade a coluna Data/Hora): quando não
+ * sobra nenhum item de texto separado na faixa de X esperada para
+ * Data/Hora, isso sinaliza que a Data/Hora se fundiu com a Descrição. O
+ * reparo localiza a ÚLTIMA ocorrência de HH:MM no texto corrompido, usa a
+ * data de referência do cabeçalho para reconstituir a sequência "data-"
+ * caractere a caractere e recupera o restante como descrição real.
+ * -------------------------------------------------------------------- */
+
+const LABEL_PHRASES = {
+  os: 'nro os',
+  cliente: 'nome cliente',
+  fantasia: 'nome fantasia',
+  quantidade: 'quantidade',
+  descricao: 'descricao',
+  datahora: 'dt.previsao cliente',
+  valor: 'valor os'
+};
+
+// Faixas de X calibradas manualmente no relatório real (fallback quando a
+// detecção dinâmica pelo cabeçalho não é possível).
+const FALLBACK = {
+  osX1: 63,
+  clienteX1: 250,
+  fantasiaX1: 455,
+  datahoraX0: 748,
+  datahoraX1: 838
+};
+
+function groupLines(items) {
+  const sorted = items.slice().sort((a, b) => b.y - a.y || a.x - b.x);
+  const TOL = 2.5;
+  const lines = [];
+  for (const it of sorted) {
+    let line = lines.find(l => Math.abs(l.y - it.y) <= TOL);
+    if (!line) {
+      line = { y: it.y, items: [] };
+      lines.push(line);
+    }
+    line.items.push(it);
+  }
+  for (const l of lines) l.items.sort((a, b) => a.x - b.x);
+  return lines;
+}
+
+function buildHeaderIndex(items) {
+  let text = '';
+  const charX = [];
+  for (const it of items) {
+    const t = normalize(it.text);
+    for (let i = 0; i < t.length; i++) charX.push(it.x);
+    text += t;
+    text += ' ';
+    charX.push(it.x);
+  }
+  return { text, charX };
+}
+
+function findHeaderLine(lines) {
+  let best = null, bestCount = 0;
+  for (const line of lines) {
+    const idx = buildHeaderIndex(line.items);
+    let count = 0;
+    for (const phrase of Object.values(LABEL_PHRASES)) {
+      if (idx.text.includes(phrase)) count++;
+    }
+    if (count > bestCount) {
+      bestCount = count;
+      best = line;
+    }
+  }
+  return bestCount >= 3 ? best : null;
+}
+
+function findReferenceDate(lines) {
+  for (const line of lines) {
+    const text = line.items.map(i => i.text).join(' ');
+    const m = text.match(/Dt\.?\s*previs[ãa]o\s*cliente\s*:?\s*(\d{2}\/\d{2}\/\d{4})/i);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+function computeBounds(headerLine) {
+  let osX1 = FALLBACK.osX1, clienteX1 = FALLBACK.clienteX1, fantasiaX1 = FALLBACK.fantasiaX1;
+  let datahoraX0 = FALLBACK.datahoraX0, datahoraX1 = FALLBACK.datahoraX1;
+  let quantidadeX1 = null;
+
+  if (headerLine) {
+    const idx = buildHeaderIndex(headerLine.items);
+    const xOf = phrase => {
+      const p = idx.text.indexOf(phrase);
+      return p >= 0 ? idx.charX[p] : null;
+    };
+    const xOs = xOf(LABEL_PHRASES.os);
+    const xCliente = xOf(LABEL_PHRASES.cliente);
+    const xFantasia = xOf(LABEL_PHRASES.fantasia);
+    const xQuantidade = xOf(LABEL_PHRASES.quantidade);
+    const xDescricao = xOf(LABEL_PHRASES.descricao);
+    const xDatahora = xOf(LABEL_PHRASES.datahora);
+    const xValor = xOf(LABEL_PHRASES.valor);
+
+    if (xOs != null && xCliente != null) osX1 = (xOs + xCliente) / 2;
+    if (xCliente != null && xFantasia != null) clienteX1 = (xCliente + xFantasia) / 2;
+    if (xFantasia != null) {
+      const nextX = (xQuantidade != null ? xQuantidade : (xDescricao != null ? xDescricao : (xDatahora != null ? xDatahora : xValor)));
+      if (nextX != null) fantasiaX1 = (xFantasia + nextX) / 2;
+    }
+    if (xQuantidade != null && xDescricao != null) quantidadeX1 = (xQuantidade + xDescricao) / 2;
+    if (xDatahora != null) {
+      const prevX = (xDescricao != null ? xDescricao : (xQuantidade != null ? xQuantidade : xFantasia));
+      if (prevX != null) datahoraX0 = (prevX + xDatahora) / 2;
+      if (xValor != null) datahoraX1 = (xDatahora + xValor) / 2;
+    }
+  }
+
+  return {
+    osX1, clienteX1, fantasiaX1, datahoraX0, datahoraX1,
+    quantidadeX1, quantidadeDetected: quantidadeX1 != null
+  };
+}
+
+function classifyLine(items, b) {
+  const buckets = { os: [], cliente: [], fantasia: [], quantidade: [], descricao: [], datahora: [], valor: [] };
+  let midband = [];
+  for (const it of items) {
+    const x = it.x;
+    if (x < b.osX1) buckets.os.push(it);
+    else if (x < b.clienteX1) buckets.cliente.push(it);
+    else if (x < b.fantasiaX1) buckets.fantasia.push(it);
+    else if (b.quantidadeDetected && x < b.quantidadeX1) buckets.quantidade.push(it);
+    else if (x < b.datahoraX0) {
+      if (b.quantidadeDetected) buckets.descricao.push(it);
+      else midband.push(it);
+    } else if (x < b.datahoraX1) buckets.datahora.push(it);
+    else buckets.valor.push(it);
+  }
+  if (!b.quantidadeDetected && midband.length) {
+    midband.sort((a, c) => a.x - c.x);
+    buckets.quantidade = [midband[0]];
+    buckets.descricao = midband.slice(1);
+  }
+  return buckets;
+}
+
+function joinBucket(arr) {
+  return (arr || [])
+    .map(i => i.text.trim())
+    .filter(Boolean)
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Algoritmo de reparo para Descrição fundida com Data/Hora (ver problema 2).
+function repairDescription(corruptedText, referenceDate) {
+  const hourMatches = [...corruptedText.matchAll(/\d{2}:\d{2}/g)];
+  if (hourMatches.length === 0 || !referenceDate) {
+    return { description: corruptedText, hora: '', ok: false };
+  }
+  const last = hourMatches[hourMatches.length - 1];
+  const hora = last[0];
+  const beforeHour = corruptedText.slice(0, last.index);
+
+  const target = referenceDate + '-';
+  let pointer = 0;
+  let rebuilt = '';
+  for (const ch of beforeHour) {
+    if (pointer < target.length && ch === target[pointer]) {
+      pointer++;
+    } else {
+      rebuilt += ch;
+    }
+  }
+  return { description: rebuilt.replace(/\s+/g, ' ').trim(), hora, ok: pointer === target.length };
+}
+
+function extractRowFromLine(line, bounds, referenceDate, warnings) {
+  const buckets = classifyLine(line.items, bounds);
+
+  const osDigits = joinBucket(buckets.os).replace(/\D/g, '');
+  if (osDigits.length < 5 || osDigits.length > 7) return null;
+
+  const cliente = joinBucket(buckets.cliente);
+  const fantasia = joinBucket(buckets.fantasia);
+  const quantText = joinBucket(buckets.quantidade);
+  const descTextRaw = joinBucket(buckets.descricao);
+  const quantidade = parseBrazilianNumber(quantText);
+
+  const dhText = joinBucket(buckets.datahora);
+  const dhMatch = dhText.match(/(\d{2}\/\d{2}\/\d{4})-(\d{2}:\d{2})/);
+
+  let dataPrevisao, horaPrevisao, repaired = false, descricao = descTextRaw;
+
+  if (dhMatch) {
+    dataPrevisao = dhMatch[1];
+    horaPrevisao = dhMatch[2];
+  } else {
+    repaired = true;
+    const rep = repairDescription(descTextRaw, referenceDate);
+    descricao = rep.description;
+    horaPrevisao = rep.hora;
+    dataPrevisao = referenceDate;
+    warnings.push({
+      osNumber: osDigits,
+      message: 'OS ' + osDigits + ': a Descrição do serviço se sobrepôs à Data/Hora no PDF original. ' +
+        'Reparo automático aplicado (data/hora e descrição reconstituídas) — confira manualmente, ' +
+        'pois caracteres finais da descrição podem ter se perdido na geração do PDF original.'
+    });
+  }
+
+  return { osNumber: osDigits, cliente, fantasia, quantidade, descricao, dataPrevisao, horaPrevisao, repaired };
+}
+
+async function extractPdfData(file) {
+  const buf = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+
+  let referenceDate = null;
+  const rowsMap = new Map();
+  const warnings = [];
+
+  for (let p = 1; p <= pdf.numPages; p++) {
+    const page = await pdf.getPage(p);
+    const content = await page.getTextContent();
+
+    const items = [];
+    for (const it of content.items) {
+      const str = it.str;
+      if (!str || !str.trim()) continue;
+      if (/^_+$/.test(str.trim())) continue; // problema 1: descarta sublinhados
+      items.push({ x: it.transform[4], y: it.transform[5], text: str });
+    }
+
+    const lines = groupLines(items);
+    if (!referenceDate) referenceDate = findReferenceDate(lines);
+    const headerLine = findHeaderLine(lines);
+    const bounds = computeBounds(headerLine);
+
+    for (const line of lines) {
+      if (headerLine && line === headerLine) continue;
+      const row = extractRowFromLine(line, bounds, referenceDate, warnings);
+      if (row && !rowsMap.has(row.osNumber)) rowsMap.set(row.osNumber, row);
+    }
+  }
+
+  return { referenceDate, rows: Array.from(rowsMap.values()), warnings };
+}
+
+/* ----------------------------------------------------------------------
+ * Leitura / escrita do .xlsx (manipulação direta do XML interno via JSZip,
+ * para garantir o preenchimento de cor amarela/vermelha nas novas linhas
+ * mesmo sem suporte a estilos de escrita em bibliotecas de planilha puras)
+ * -------------------------------------------------------------------- */
+
+function getCellText(cEl, sharedStrings) {
+  const t = cEl.getAttribute('t');
+  if (t === 'inlineStr') {
+    const isEl = cEl.getElementsByTagName('is')[0];
+    return isEl ? isEl.textContent : '';
+  }
+  const vEl = cEl.getElementsByTagName('v')[0];
+  if (!vEl) return '';
+  const raw = vEl.textContent;
+  if (t === 's') {
+    const idx = parseInt(raw, 10);
+    return sharedStrings[idx] || '';
+  }
+  return raw;
+}
+
+function parseSharedStrings(xmlStr) {
+  if (!xmlStr) return [];
+  const doc = new DOMParser().parseFromString(xmlStr, 'application/xml');
+  return Array.from(doc.getElementsByTagName('si')).map(si => si.textContent);
+}
+
+async function loadWorkbookParts(zip) {
+  const workbookXml = await zip.file('xl/workbook.xml').async('string');
+  const relsXml = await zip.file('xl/_rels/workbook.xml.rels').async('string');
+
+  const wbDoc = new DOMParser().parseFromString(workbookXml, 'application/xml');
+  const sheets = Array.from(wbDoc.getElementsByTagName('sheet'));
+  let target = sheets.find(s => s.getAttribute('name') === 'OS em Aberto');
+  const usedFallbackSheet = !target;
+  if (!target) target = sheets[0];
+  if (!target) throw new Error('A planilha não contém nenhuma aba.');
+
+  let rId = target.getAttribute('r:id');
+  if (!rId) rId = target.getAttributeNS('http://schemas.openxmlformats.org/officeDocument/2006/relationships', 'id');
+
+  const relsDoc = new DOMParser().parseFromString(relsXml, 'application/xml');
+  const relEl = Array.from(relsDoc.getElementsByTagName('Relationship')).find(r => r.getAttribute('Id') === rId);
+  if (!relEl) throw new Error('Não foi possível localizar o arquivo da aba na planilha.');
+
+  let targetPath = relEl.getAttribute('Target');
+  targetPath = targetPath.replace(/^\.?\//, '');
+  if (!targetPath.startsWith('xl/')) targetPath = 'xl/' + targetPath;
+
+  const sheetFile = zip.file(targetPath);
+  if (!sheetFile) throw new Error('Arquivo da aba "' + targetPath + '" não encontrado dentro do .xlsx.');
+  const sheetXml = await sheetFile.async('string');
+
+  let sharedStrings = [];
+  const ssFile = zip.file('xl/sharedStrings.xml');
+  if (ssFile) sharedStrings = parseSharedStrings(await ssFile.async('string'));
+
+  const stylesFile = zip.file('xl/styles.xml');
+  const stylesXml = stylesFile ? await stylesFile.async('string') : null;
+  if (!stylesXml) throw new Error('Arquivo xl/styles.xml não encontrado dentro do .xlsx.');
+
+  return { sheetXml, sheetPath: targetPath, sharedStrings, stylesXml, usedFallbackSheet, sheetName: target.getAttribute('name') };
+}
+
+function parseSheetForMerge(sheetXmlStr, sharedStrings) {
+  const doc = new DOMParser().parseFromString(sheetXmlStr, 'application/xml');
+  const rows = Array.from(doc.getElementsByTagName('row'));
+
+  let totalsRowNum = null;
+  for (const row of rows) {
+    const cCells = Array.from(row.getElementsByTagName('c')).filter(c => /^C\d+$/.test(c.getAttribute('r') || ''));
+    for (const c of cCells) {
+      const val = getCellText(c, sharedStrings);
+      if (val && /total\s*de\s*os/i.test(val)) totalsRowNum = parseInt(row.getAttribute('r'), 10);
+    }
+  }
+
+  const existingOS = new Set();
+  if (totalsRowNum) {
+    for (const row of rows) {
+      const rNum = parseInt(row.getAttribute('r'), 10);
+      if (!(rNum > 1 && rNum < totalsRowNum)) continue;
+      const aCell = Array.from(row.getElementsByTagName('c')).find(c => /^A\d+$/.test(c.getAttribute('r') || ''));
+      if (aCell) {
+        const val = getCellText(aCell, sharedStrings);
+        const digits = (val || '').replace(/\D/g, '');
+        if (digits) existingOS.add(digits);
+      }
+    }
+  }
+
+  return { totalsRowNum, existingOS };
+}
+
+function getRowNum(rowStr) {
+  const m = rowStr.match(/<row\b[^>]*\br="(\d+)"/);
+  return m ? parseInt(m[1], 10) : null;
+}
+
+function shiftRowNumber(rowStr, newRowNum) {
+  const tagEndIdx = rowStr.indexOf('>');
+  let openTag = rowStr.slice(0, tagEndIdx + 1);
+  let rest = rowStr.slice(tagEndIdx + 1);
+  openTag = openTag.replace(/\br="\d+"/, 'r="' + newRowNum + '"');
+  rest = rest.replace(/\br="([A-Z]+)\d+"/g, (m, letters) => 'r="' + letters + newRowNum + '"');
+  return openTag + rest;
+}
+
+function replaceCellFormula(rowStr, colLetter, formulaText) {
+  const re = new RegExp('<c r="' + colLetter + '(\\d+)"([^>]*?)(?:/>|>[\\s\\S]*?</c>)');
+  return rowStr.replace(re, (m, rowNum, attrs) => {
+    const sMatch = attrs.match(/\bs="[^"]*"/);
+    const sAttr = sMatch ? ' ' + sMatch[0] : '';
+    return '<c r="' + colLetter + rowNum + '"' + sAttr + '><f>' + formulaText + '</f></c>';
+  });
+}
+
+function shiftSingleRef(ref, threshold, delta) {
+  return ref.replace(/([A-Z]+)(\d+)/g, (m, col, rowStr) => {
+    const row = parseInt(rowStr, 10);
+    return row >= threshold ? col + (row + delta) : m;
+  });
+}
+
+function buildNewRowXml(rowNum, data, styleIdx) {
+  const cells = [];
+  cells.push('<c r="A' + rowNum + '"><v>' + data.osNumber + '</v></c>');
+  cells.push('<c r="B' + rowNum + '" s="' + styleIdx.yellow + '"/>');
+  cells.push('<c r="C' + rowNum + '" t="inlineStr"><is><t xml:space="preserve">' + escapeXml(data.cliente) + '</t></is></c>');
+  cells.push('<c r="D' + rowNum + '" s="' + styleIdx.yellow + '"/>');
+  if (data.fantasia) {
+    cells.push('<c r="E' + rowNum + '" t="inlineStr"><is><t xml:space="preserve">' + escapeXml(data.fantasia) + '</t></is></c>');
+  } else {
+    cells.push('<c r="E' + rowNum + '"/>');
+  }
+  cells.push('<c r="F' + rowNum + '"><v>' + data.quantidade + '</v></c>');
+  const gStyleAttr = data.repaired ? ' s="' + styleIdx.red + '"' : '';
+  cells.push('<c r="G' + rowNum + '"' + gStyleAttr + ' t="inlineStr"><is><t xml:space="preserve">' + escapeXml(data.descricao) + '</t></is></c>');
+  cells.push('<c r="H' + rowNum + '" t="inlineStr"><is><t xml:space="preserve">' + escapeXml(data.dataPrevisao || '') + '</t></is></c>');
+  cells.push('<c r="I' + rowNum + '" t="inlineStr"><is><t xml:space="preserve">' + escapeXml(data.horaPrevisao || '') + '</t></is></c>');
+  return '<row r="' + rowNum + '" spans="1:9">' + cells.join('') + '</row>';
+}
+
+function addFillsAndStyles(stylesXml) {
+  const fillsCountMatch = stylesXml.match(/<fills count="(\d+)">/);
+  const oldFillsCount = parseInt(fillsCountMatch[1], 10);
+  const yellowFillIdx = oldFillsCount;
+  const redFillIdx = oldFillsCount + 1;
+  const newFills =
+    '<fill><patternFill patternType="solid"><fgColor rgb="FFFFFF00"/><bgColor indexed="64"/></patternFill></fill>' +
+    '<fill><patternFill patternType="solid"><fgColor rgb="FFFFC7CE"/><bgColor indexed="64"/></patternFill></fill>';
+  let out = stylesXml.replace(/<fills count="\d+">/, '<fills count="' + (oldFillsCount + 2) + '">');
+  out = out.replace('</fills>', newFills + '</fills>');
+
+  const cellXfsCountMatch = out.match(/<cellXfs count="(\d+)">/);
+  const oldXfsCount = parseInt(cellXfsCountMatch[1], 10);
+  const yellowStyleIdx = oldXfsCount;
+  const redStyleIdx = oldXfsCount + 1;
+  const newXfs =
+    '<xf numFmtId="0" fontId="0" fillId="' + yellowFillIdx + '" borderId="0" xfId="0" applyFill="1"/>' +
+    '<xf numFmtId="0" fontId="0" fillId="' + redFillIdx + '" borderId="0" xfId="0" applyFill="1"/>';
+  out = out.replace(/<cellXfs count="\d+">/, '<cellXfs count="' + (oldXfsCount + 2) + '">');
+  out = out.replace('</cellXfs>', newXfs + '</cellXfs>');
+
+  return { stylesXml: out, yellowStyleIdx, redStyleIdx };
+}
+
+function updateSheetXml(sheetXml, { totalsRowNum, newRows, N, styleIdx }) {
+  const openTagMatch = sheetXml.match(/<sheetData[^>]*>/);
+  const openTag = openTagMatch[0];
+  const openIdx = sheetXml.indexOf(openTag) + openTag.length;
+  const closeIdx = sheetXml.indexOf('</sheetData>');
+  const inner = sheetXml.slice(openIdx, closeIdx);
+
+  const rowMatches = inner.match(/<row\b[^>]*\/>|<row\b[^>]*>[\s\S]*?<\/row>/g) || [];
+
+  const outRows = [];
+  for (const rowStr of rowMatches) {
+    const num = getRowNum(rowStr);
+    if (num !== null && num >= totalsRowNum) {
+      const newNum = num + N;
+      let shifted = shiftRowNumber(rowStr, newNum);
+      const isTotals = num === totalsRowNum;
+      if (isTotals) {
+        const newLastDataRow = totalsRowNum + N - 1;
+        shifted = replaceCellFormula(shifted, 'A', 'COUNTA(A2:A' + newLastDataRow + ')');
+        shifted = replaceCellFormula(shifted, 'F', 'SUM(F2:F' + newLastDataRow + ')');
+      }
+      outRows.push({ num: newNum, str: shifted, isTotals });
+    } else {
+      outRows.push({ num, str: rowStr, isTotals: false });
+    }
+  }
+
+  let insertIdx = outRows.findIndex(r => r.isTotals);
+  if (insertIdx === -1) insertIdx = outRows.length;
+
+  const newRowStrs = newRows.map((data, i) => buildNewRowXml(totalsRowNum + i, data, styleIdx));
+
+  const finalParts = [];
+  for (let i = 0; i < outRows.length; i++) {
+    if (i === insertIdx) finalParts.push(...newRowStrs);
+    finalParts.push(outRows[i].str);
+  }
+  if (insertIdx === outRows.length) finalParts.push(...newRowStrs);
+
+  const newInner = finalParts.join('');
+  let newXml = sheetXml.slice(0, openIdx) + newInner + sheetXml.slice(closeIdx);
+
+  const maxRow = totalsRowNum + N;
+  newXml = newXml.replace(/(<dimension ref=")([^"]*)(")/, (m, p1, val, p3) => {
+    const start = val.split(':')[0];
+    return p1 + start + ':I' + maxRow + p3;
+  });
+
+  newXml = newXml.replace(/(<mergeCell ref=")([^"]*)(")/g, (m, p1, ref, p3) => p1 + shiftSingleRef(ref, totalsRowNum, N) + p3);
+  newXml = newXml.replace(/(<autoFilter ref=")([^"]*)(")/g, (m, p1, ref, p3) => p1 + shiftSingleRef(ref, totalsRowNum, N) + p3);
+
+  return newXml;
+}
+
+/* ----------------------------------------------------------------------
+ * UI
+ * -------------------------------------------------------------------- */
+const pdfInput = document.getElementById('pdfInput');
+const xlsxInput = document.getElementById('xlsxInput');
+const processBtn = document.getElementById('processBtn');
+const downloadBtn = document.getElementById('downloadBtn');
+const statusEl = document.getElementById('status');
+const resultCard = document.getElementById('resultCard');
+const summaryEl = document.getElementById('summary');
+
+let pendingBlob = null;
+let pendingFilename = null;
+
+function setStatus(msg) { statusEl.textContent = msg || ''; }
+
+function showBox(html) {
+  resultCard.classList.remove('hidden');
+  summaryEl.innerHTML = html;
+}
+
+function renderSummary({ pdfData, newRows, existingCount, sheetFallback, sheetName }) {
+  let html = '';
+  html += '<p><strong>Data de previsão do relatório:</strong> ' + (pdfData.referenceDate || '<em>não identificada</em>') + '</p>';
+  html += '<p><strong>Total de OS lidas no PDF:</strong> ' + pdfData.rows.length + '</p>';
+  html += '<p><strong>OS já existentes na planilha:</strong> ' + existingCount + '</p>';
+  html += '<p><strong>OS novas adicionadas:</strong> ' + newRows.length + '</p>';
+
+  if (sheetFallback) {
+    html += '<div class="box warn">Aviso: a aba <code>OS em Aberto</code> não foi encontrada; foi usada a aba <code>' +
+      escapeXml(sheetName) + '</code>.</div>';
+  }
+
+  if (newRows.length) {
+    html += '<p><strong>Nro OS adicionadas:</strong><br>' +
+      newRows.map(r => escapeXml(r.osNumber)).join(', ') + '</p>';
+  }
+
+  if (pdfData.warnings.length) {
+    html += '<div class="box warn"><strong>Avisos — conferir manualmente (' + pdfData.warnings.length + '):</strong><ul>' +
+      pdfData.warnings.map(w => '<li>' + escapeXml(w.message) + '</li>').join('') +
+      '</ul></div>';
+  } else {
+    html += '<div class="box ok">Nenhuma sobreposição de Descrição/Data-Hora detectada neste relatório.</div>';
+  }
+
+  showBox(html);
+}
+
+function showError(msg) {
+  resultCard.classList.remove('hidden');
+  summaryEl.innerHTML = '<div class="box error"><strong>Erro:</strong> ' + escapeXml(msg) + '</div>';
+}
+
+processBtn.addEventListener('click', async () => {
+  const pdfFile = pdfInput.files[0];
+  const xlsxFile = xlsxInput.files[0];
+  downloadBtn.classList.add('hidden');
+  pendingBlob = null;
+
+  if (!pdfFile || !xlsxFile) {
+    showError('Selecione o PDF do relatório e a planilha .xlsx antes de processar.');
+    return;
+  }
+
+  processBtn.disabled = true;
+  try {
+    setStatus('Lendo e interpretando o PDF...');
+    const pdfData = await extractPdfData(pdfFile);
+
+    if (pdfData.rows.length === 0) {
+      showError('Nenhuma OS foi encontrada no PDF selecionado. Verifique se é o relatório correto.');
+      return;
+    }
+
+    setStatus('Lendo a planilha .xlsx...');
+    const xlsxBuf = await xlsxFile.arrayBuffer();
+    const zip = await JSZip.loadAsync(xlsxBuf);
+    const parts = await loadWorkbookParts(zip);
+    const { totalsRowNum, existingOS } = parseSheetForMerge(parts.sheetXml, parts.sharedStrings);
+
+    if (!totalsRowNum) {
+      showError('Não foi possível localizar a linha de totais ("Total de OS / Quantidade") na aba "' +
+        parts.sheetName + '". Verifique a estrutura da planilha.');
+      return;
+    }
+
+    const newRows = pdfData.rows
+      .filter(r => !existingOS.has(r.osNumber))
+      .sort((a, b) => a.osNumber.localeCompare(b.osNumber, undefined, { numeric: true }));
+
+    setStatus('Montando planilha atualizada...');
+    let updatedSheetXml = parts.sheetXml;
+    let updatedStylesXml = parts.stylesXml;
+
+    if (newRows.length > 0) {
+      const { stylesXml, yellowStyleIdx, redStyleIdx } = addFillsAndStyles(parts.stylesXml);
+      updatedStylesXml = stylesXml;
+      updatedSheetXml = updateSheetXml(parts.sheetXml, {
+        totalsRowNum, newRows, N: newRows.length,
+        styleIdx: { yellow: yellowStyleIdx, red: redStyleIdx }
+      });
+    }
+
+    zip.file(parts.sheetPath, updatedSheetXml);
+    zip.file('xl/styles.xml', updatedStylesXml);
+
+    const blob = await zip.generateAsync({
+      type: 'blob',
+      mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    });
+
+    pendingBlob = blob;
+    pendingFilename = xlsxFile.name.replace(/\.xlsx$/i, '') + '_atualizada.xlsx';
+    downloadBtn.classList.remove('hidden');
+
+    renderSummary({
+      pdfData, newRows,
+      existingCount: existingOS.size,
+      sheetFallback: parts.usedFallbackSheet,
+      sheetName: parts.sheetName
+    });
+    setStatus('Concluído.');
+  } catch (err) {
+    console.error(err);
+    showError(err.message || String(err));
+    setStatus('');
+  } finally {
+    processBtn.disabled = false;
+  }
+});
+
+downloadBtn.addEventListener('click', () => {
+  if (pendingBlob) downloadBlob(pendingBlob, pendingFilename);
+});
+</script>
+</body>
+</html>
