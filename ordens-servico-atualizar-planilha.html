@@ -292,9 +292,19 @@ function classifyLine(items, b) {
     else buckets.valor.push(it);
   }
   if (!b.quantidadeDetected && midband.length) {
+    // Quantidade e Descrição costumam vir como UM ÚNICO item de texto do PDF
+    // (ex.: "975.000 Cinta - 2litros - Sendo 9 Modelos"), não dois itens
+    // separados. Junta tudo e separa pelo número inicial (a quantidade).
     midband.sort((a, c) => a.x - c.x);
-    buckets.quantidade = [midband[0]];
-    buckets.descricao = midband.slice(1);
+    const combined = midband.map(i => i.text.trim()).filter(Boolean).join(' ');
+    const m = combined.match(/^([\d.,]+)\s+([\s\S]*)$/);
+    if (m) {
+      buckets.quantidade = [{ x: 0, y: 0, text: m[1] }];
+      buckets.descricao = [{ x: 0, y: 0, text: m[2] }];
+    } else {
+      buckets.quantidade = [{ x: 0, y: 0, text: '0' }];
+      buckets.descricao = midband;
+    }
   }
   return buckets;
 }
@@ -304,6 +314,11 @@ function joinBucket(arr) {
     .map(i => i.text.trim())
     .filter(Boolean)
     .join(' ')
+    // remove sublinhados que "vazaram" para dentro do mesmo item de texto de
+    // outra coluna (ex.: "Cliente Ltda ______________"), quando o filtro por
+    // item inteiro (feito em extractPdfData) não é suficiente porque o PDF
+    // gerou tudo como um único item de texto.
+    .replace(/_{2,}/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -465,7 +480,7 @@ async function loadWorkbookParts(zip) {
   const stylesXml = stylesFile ? await stylesFile.async('string') : null;
   if (!stylesXml) throw new Error('Arquivo xl/styles.xml não encontrado dentro do .xlsx.');
 
-  return { sheetXml, sheetPath: targetPath, sharedStrings, stylesXml, usedFallbackSheet, sheetName: target.getAttribute('name') };
+  return { workbookXml, sheetXml, sheetPath: targetPath, sharedStrings, stylesXml, usedFallbackSheet, sheetName: target.getAttribute('name') };
 }
 
 function parseSheetForMerge(sheetXmlStr, sharedStrings) {
@@ -528,9 +543,40 @@ function shiftSingleRef(ref, threshold, delta) {
   });
 }
 
+// Faixas como o autoFilter (ex.: "A1:I47") e o nome definido _FilterDatabase
+// costumam terminar exatamente na última linha de dados ANTES da linha de
+// totais (totalsRowNum - 1). Como essa linha em si não é deslocada (só as
+// linhas novas são inseridas logo depois dela), shiftSingleRef não a
+// alcança — por isso ela precisa ser "esticada" separadamente para
+// continuar cobrindo as OS novas.
+function bumpRangeEndRow(ref, oldLastDataRow, newLastDataRow) {
+  const parts = ref.split(':');
+  if (parts.length !== 2) return ref;
+  const m = parts[1].match(/^([A-Z]+)(\d+)$/);
+  if (!m) return ref;
+  if (parseInt(m[2], 10) !== oldLastDataRow) return ref;
+  return parts[0] + ':' + m[1] + newLastDataRow;
+}
+
+function updateWorkbookXml(workbookXml, oldLastDataRow, newLastDataRow) {
+  return workbookXml.replace(
+    /(<definedName[^>]*name="_xlnm\._FilterDatabase"[^>]*>)([^<]*)(<\/definedName>)/,
+    (m, open, inner, close) => {
+      const bumped = inner.replace(/(\$?)(\d+)\s*$/, (mm, dollar, rowStr) =>
+        parseInt(rowStr, 10) === oldLastDataRow ? dollar + newLastDataRow : mm
+      );
+      return open + bumped + close;
+    }
+  );
+}
+
 function buildNewRowXml(rowNum, data, styleIdx) {
   const cells = [];
-  cells.push('<c r="A' + rowNum + '"><v>' + data.osNumber + '</v></c>');
+  // Nro OS é gravado como texto (inlineStr), pois é assim que a maioria das
+  // planilhas de usuário já armazena esse campo (evita OS virar número
+  // alinhado à direita, diferente do restante da coluna, e preserva
+  // eventuais zeros à esquerda).
+  cells.push('<c r="A' + rowNum + '" t="inlineStr"><is><t xml:space="preserve">' + escapeXml(data.osNumber) + '</t></is></c>');
   cells.push('<c r="B' + rowNum + '" s="' + styleIdx.yellow + '"/>');
   cells.push('<c r="C' + rowNum + '" t="inlineStr"><is><t xml:space="preserve">' + escapeXml(data.cliente) + '</t></is></c>');
   cells.push('<c r="D' + rowNum + '" s="' + styleIdx.yellow + '"/>');
@@ -620,7 +666,10 @@ function updateSheetXml(sheetXml, { totalsRowNum, newRows, N, styleIdx }) {
   });
 
   newXml = newXml.replace(/(<mergeCell ref=")([^"]*)(")/g, (m, p1, ref, p3) => p1 + shiftSingleRef(ref, totalsRowNum, N) + p3);
-  newXml = newXml.replace(/(<autoFilter ref=")([^"]*)(")/g, (m, p1, ref, p3) => p1 + shiftSingleRef(ref, totalsRowNum, N) + p3);
+
+  const oldLastDataRow = totalsRowNum - 1;
+  const newLastDataRow = totalsRowNum + N - 1;
+  newXml = newXml.replace(/(<autoFilter ref=")([^"]*)(")/g, (m, p1, ref, p3) => p1 + bumpRangeEndRow(ref, oldLastDataRow, newLastDataRow) + p3);
 
   return newXml;
 }
@@ -719,6 +768,7 @@ processBtn.addEventListener('click', async () => {
     setStatus('Montando planilha atualizada...');
     let updatedSheetXml = parts.sheetXml;
     let updatedStylesXml = parts.stylesXml;
+    let updatedWorkbookXml = parts.workbookXml;
 
     if (newRows.length > 0) {
       const { stylesXml, yellowStyleIdx, redStyleIdx } = addFillsAndStyles(parts.stylesXml);
@@ -727,10 +777,12 @@ processBtn.addEventListener('click', async () => {
         totalsRowNum, newRows, N: newRows.length,
         styleIdx: { yellow: yellowStyleIdx, red: redStyleIdx }
       });
+      updatedWorkbookXml = updateWorkbookXml(parts.workbookXml, totalsRowNum - 1, totalsRowNum + newRows.length - 1);
     }
 
     zip.file(parts.sheetPath, updatedSheetXml);
     zip.file('xl/styles.xml', updatedStylesXml);
+    zip.file('xl/workbook.xml', updatedWorkbookXml);
 
     const blob = await zip.generateAsync({
       type: 'blob',
