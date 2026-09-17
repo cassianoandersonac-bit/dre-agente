@@ -81,7 +81,7 @@
 <body>
 <div class="container">
   <h1>Atualizar Planilha de Ordens de Serviço em Aberto</h1>
-  <p class="subtitle">Ferramenta 100% local: nada é enviado a nenhum servidor. Selecione o PDF diário da Unigráfica e a planilha .xlsx atual para mesclar as OS novas sem perder o que já foi preenchido manualmente.</p>
+  <p class="subtitle">Ferramenta 100% local: nada é enviado a nenhum servidor. Selecione o PDF diário da Unigráfica e a planilha .xlsx atual para adicionar as OS novas (preservando o que já foi preenchido manualmente nas OS existentes) e remover as OS que não aparecem mais no relatório (já concluídas/baixadas).</p>
 
   <div class="card">
     <div class="field">
@@ -497,6 +497,7 @@ function parseSheetForMerge(sheetXmlStr, sharedStrings) {
   }
 
   const existingOS = new Set();
+  const rowOS = new Map(); // rowNum -> Nro OS (só linhas de dados com OS preenchida)
   if (totalsRowNum) {
     for (const row of rows) {
       const rNum = parseInt(row.getAttribute('r'), 10);
@@ -505,12 +506,15 @@ function parseSheetForMerge(sheetXmlStr, sharedStrings) {
       if (aCell) {
         const val = getCellText(aCell, sharedStrings);
         const digits = (val || '').replace(/\D/g, '');
-        if (digits) existingOS.add(digits);
+        if (digits) {
+          existingOS.add(digits);
+          rowOS.set(rNum, digits);
+        }
       }
     }
   }
 
-  return { totalsRowNum, existingOS };
+  return { totalsRowNum, existingOS, rowOS };
 }
 
 function getRowNum(rowStr) {
@@ -536,19 +540,11 @@ function replaceCellFormula(rowStr, colLetter, formulaText) {
   });
 }
 
-function shiftSingleRef(ref, threshold, delta) {
-  return ref.replace(/([A-Z]+)(\d+)/g, (m, col, rowStr) => {
-    const row = parseInt(rowStr, 10);
-    return row >= threshold ? col + (row + delta) : m;
-  });
-}
-
 // Faixas como o autoFilter (ex.: "A1:I47") e o nome definido _FilterDatabase
 // costumam terminar exatamente na última linha de dados ANTES da linha de
-// totais (totalsRowNum - 1). Como essa linha em si não é deslocada (só as
-// linhas novas são inseridas logo depois dela), shiftSingleRef não a
-// alcança — por isso ela precisa ser "esticada" separadamente para
-// continuar cobrindo as OS novas.
+// totais (totalsRowNum - 1). Essa linha-limite pode não corresponder a
+// nenhuma linha real após remoções/inserções, então o fim do intervalo é
+// esticado/encolhido diretamente para a nova última linha de dados.
 function bumpRangeEndRow(ref, oldLastDataRow, newLastDataRow) {
   const parts = ref.split(':');
   if (parts.length !== 2) return ref;
@@ -617,7 +613,12 @@ function addFillsAndStyles(stylesXml) {
   return { stylesXml: out, yellowStyleIdx, redStyleIdx };
 }
 
-function updateSheetXml(sheetXml, { totalsRowNum, newRows, N, styleIdx }) {
+// Reconstrói o bloco de linhas da planilha: remove as linhas de OS que não
+// aparecem mais no PDF (já concluídas/baixadas), acrescenta as OS novas no
+// fim dos dados e renumera tudo sequencialmente antes da linha de totais.
+// Quando removedRowNums está vazio, o resultado é idêntico ao antigo
+// comportamento apenas-aditivo (linhas mantêm seu número original).
+function updateSheetXml(sheetXml, { totalsRowNum, removedRowNums, newRows, styleIdx }) {
   const openTagMatch = sheetXml.match(/<sheetData[^>]*>/);
   const openTag = openTagMatch[0];
   const openIdx = sheetXml.indexOf(openTag) + openTag.length;
@@ -626,52 +627,65 @@ function updateSheetXml(sheetXml, { totalsRowNum, newRows, N, styleIdx }) {
 
   const rowMatches = inner.match(/<row\b[^>]*\/>|<row\b[^>]*>[\s\S]*?<\/row>/g) || [];
 
-  const outRows = [];
+  const headerRows = [];
+  const keptDataRows = []; // { oldNum, str }
+  let totalsRowStr = null;
+  const afterRows = []; // linhas depois da linha de totais (raro)
+
   for (const rowStr of rowMatches) {
     const num = getRowNum(rowStr);
-    if (num !== null && num >= totalsRowNum) {
-      const newNum = num + N;
-      let shifted = shiftRowNumber(rowStr, newNum);
-      const isTotals = num === totalsRowNum;
-      if (isTotals) {
-        const newLastDataRow = totalsRowNum + N - 1;
-        shifted = replaceCellFormula(shifted, 'A', 'COUNTA(A2:A' + newLastDataRow + ')');
-        shifted = replaceCellFormula(shifted, 'F', 'SUM(F2:F' + newLastDataRow + ')');
-      }
-      outRows.push({ num: newNum, str: shifted, isTotals });
-    } else {
-      outRows.push({ num, str: rowStr, isTotals: false });
+    if (num === 1) headerRows.push(rowStr);
+    else if (num === totalsRowNum) totalsRowStr = rowStr;
+    else if (num !== null && num > totalsRowNum) afterRows.push({ oldNum: num, str: rowStr });
+    else if (num !== null && num > 1 && num < totalsRowNum) {
+      if (!removedRowNums.has(num)) keptDataRows.push({ oldNum: num, str: rowStr });
     }
   }
 
-  let insertIdx = outRows.findIndex(r => r.isTotals);
-  if (insertIdx === -1) insertIdx = outRows.length;
+  const rowRemap = new Map(); // número antigo -> número novo (para mergeCell etc.)
+  let seq = 2;
+  const renumberedDataRows = keptDataRows.map(({ oldNum, str }) => {
+    rowRemap.set(oldNum, seq);
+    return shiftRowNumber(str, seq++);
+  });
 
-  const newRowStrs = newRows.map((data, i) => buildNewRowXml(totalsRowNum + i, data, styleIdx));
+  const newRowStrs = newRows.map(data => buildNewRowXml(seq++, data, styleIdx));
 
-  const finalParts = [];
-  for (let i = 0; i < outRows.length; i++) {
-    if (i === insertIdx) finalParts.push(...newRowStrs);
-    finalParts.push(outRows[i].str);
-  }
-  if (insertIdx === outRows.length) finalParts.push(...newRowStrs);
+  const newTotalsRowNum = seq;
+  const newLastDataRow = newTotalsRowNum - 1;
+  rowRemap.set(totalsRowNum, newTotalsRowNum);
+  let newTotalsRowStr = shiftRowNumber(totalsRowStr, newTotalsRowNum);
+  newTotalsRowStr = replaceCellFormula(newTotalsRowStr, 'A', 'COUNTA(A2:A' + newLastDataRow + ')');
+  newTotalsRowStr = replaceCellFormula(newTotalsRowStr, 'F', 'SUM(F2:F' + newLastDataRow + ')');
 
+  const delta = newTotalsRowNum - totalsRowNum;
+  const renumberedAfterRows = afterRows.map(({ oldNum, str }) => {
+    const n = oldNum + delta;
+    rowRemap.set(oldNum, n);
+    return shiftRowNumber(str, n);
+  });
+
+  const finalParts = [...headerRows, ...renumberedDataRows, ...newRowStrs, newTotalsRowStr, ...renumberedAfterRows];
   const newInner = finalParts.join('');
   let newXml = sheetXml.slice(0, openIdx) + newInner + sheetXml.slice(closeIdx);
 
-  const maxRow = totalsRowNum + N;
   newXml = newXml.replace(/(<dimension ref=")([^"]*)(")/, (m, p1, val, p3) => {
     const start = val.split(':')[0];
-    return p1 + start + ':I' + maxRow + p3;
+    return p1 + start + ':I' + newTotalsRowNum + p3;
   });
 
-  newXml = newXml.replace(/(<mergeCell ref=")([^"]*)(")/g, (m, p1, ref, p3) => p1 + shiftSingleRef(ref, totalsRowNum, N) + p3);
+  newXml = newXml.replace(/(<mergeCell ref=")([^"]*)(")/g, (m, p1, ref, p3) => {
+    const remapped = ref.replace(/([A-Z]+)(\d+)/g, (mm, col, rowStr) => {
+      const newRow = rowRemap.get(parseInt(rowStr, 10));
+      return newRow != null ? col + newRow : mm;
+    });
+    return p1 + remapped + p3;
+  });
 
   const oldLastDataRow = totalsRowNum - 1;
-  const newLastDataRow = totalsRowNum + N - 1;
   newXml = newXml.replace(/(<autoFilter ref=")([^"]*)(")/g, (m, p1, ref, p3) => p1 + bumpRangeEndRow(ref, oldLastDataRow, newLastDataRow) + p3);
 
-  return newXml;
+  return { xml: newXml, newTotalsRowNum };
 }
 
 /* ----------------------------------------------------------------------
@@ -695,12 +709,13 @@ function showBox(html) {
   summaryEl.innerHTML = html;
 }
 
-function renderSummary({ pdfData, newRows, existingCount, sheetFallback, sheetName }) {
+function renderSummary({ pdfData, newRows, removedOSNumbers, existingCount, sheetFallback, sheetName }) {
   let html = '';
   html += '<p><strong>Data de previsão do relatório:</strong> ' + (pdfData.referenceDate || '<em>não identificada</em>') + '</p>';
   html += '<p><strong>Total de OS lidas no PDF:</strong> ' + pdfData.rows.length + '</p>';
   html += '<p><strong>OS já existentes na planilha:</strong> ' + existingCount + '</p>';
   html += '<p><strong>OS novas adicionadas:</strong> ' + newRows.length + '</p>';
+  html += '<p><strong>OS removidas (não constam mais no relatório):</strong> ' + removedOSNumbers.length + '</p>';
 
   if (sheetFallback) {
     html += '<div class="box warn">Aviso: a aba <code>OS em Aberto</code> não foi encontrada; foi usada a aba <code>' +
@@ -710,6 +725,13 @@ function renderSummary({ pdfData, newRows, existingCount, sheetFallback, sheetNa
   if (newRows.length) {
     html += '<p><strong>Nro OS adicionadas:</strong><br>' +
       newRows.map(r => escapeXml(r.osNumber)).join(', ') + '</p>';
+  }
+
+  if (removedOSNumbers.length) {
+    html += '<div class="box warn"><strong>OS removidas da planilha (' + removedOSNumbers.length +
+      '):</strong> essas OS não aparecem mais no relatório de hoje (provavelmente já foram concluídas/baixadas) ' +
+      'e a linha correspondente — incluindo Cidade UF e Endereço de Entrega que estivessem preenchidos — foi apagada.<br>' +
+      removedOSNumbers.map(escapeXml).join(', ') + '</div>';
   }
 
   if (pdfData.warnings.length) {
@@ -753,7 +775,7 @@ processBtn.addEventListener('click', async () => {
     const xlsxBuf = await xlsxFile.arrayBuffer();
     const zip = await JSZip.loadAsync(xlsxBuf);
     const parts = await loadWorkbookParts(zip);
-    const { totalsRowNum, existingOS } = parseSheetForMerge(parts.sheetXml, parts.sharedStrings);
+    const { totalsRowNum, existingOS, rowOS } = parseSheetForMerge(parts.sheetXml, parts.sharedStrings);
 
     if (!totalsRowNum) {
       showError('Não foi possível localizar a linha de totais ("Total de OS / Quantidade") na aba "' +
@@ -761,23 +783,41 @@ processBtn.addEventListener('click', async () => {
       return;
     }
 
+    const pdfOSSet = new Set(pdfData.rows.map(r => r.osNumber));
+
     const newRows = pdfData.rows
       .filter(r => !existingOS.has(r.osNumber))
       .sort((a, b) => a.osNumber.localeCompare(b.osNumber, undefined, { numeric: true }));
+
+    // OS que estavam na planilha mas não aparecem mais no PDF de hoje
+    // (já concluídas/baixadas) — a linha correspondente é removida.
+    const removedRowNums = new Set();
+    const removedOSNumbers = [];
+    for (const [rowNum, os] of rowOS.entries()) {
+      if (!pdfOSSet.has(os)) {
+        removedRowNums.add(rowNum);
+        removedOSNumbers.push(os);
+      }
+    }
+    removedOSNumbers.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
 
     setStatus('Montando planilha atualizada...');
     let updatedSheetXml = parts.sheetXml;
     let updatedStylesXml = parts.stylesXml;
     let updatedWorkbookXml = parts.workbookXml;
 
-    if (newRows.length > 0) {
-      const { stylesXml, yellowStyleIdx, redStyleIdx } = addFillsAndStyles(parts.stylesXml);
-      updatedStylesXml = stylesXml;
-      updatedSheetXml = updateSheetXml(parts.sheetXml, {
-        totalsRowNum, newRows, N: newRows.length,
-        styleIdx: { yellow: yellowStyleIdx, red: redStyleIdx }
+    if (newRows.length > 0 || removedRowNums.size > 0) {
+      let styleIdx = null;
+      if (newRows.length > 0) {
+        const { stylesXml, yellowStyleIdx, redStyleIdx } = addFillsAndStyles(parts.stylesXml);
+        updatedStylesXml = stylesXml;
+        styleIdx = { yellow: yellowStyleIdx, red: redStyleIdx };
+      }
+      const { xml, newTotalsRowNum } = updateSheetXml(parts.sheetXml, {
+        totalsRowNum, removedRowNums, newRows, styleIdx
       });
-      updatedWorkbookXml = updateWorkbookXml(parts.workbookXml, totalsRowNum - 1, totalsRowNum + newRows.length - 1);
+      updatedSheetXml = xml;
+      updatedWorkbookXml = updateWorkbookXml(parts.workbookXml, totalsRowNum - 1, newTotalsRowNum - 1);
     }
 
     zip.file(parts.sheetPath, updatedSheetXml);
@@ -794,7 +834,7 @@ processBtn.addEventListener('click', async () => {
     downloadBtn.classList.remove('hidden');
 
     renderSummary({
-      pdfData, newRows,
+      pdfData, newRows, removedOSNumbers,
       existingCount: existingOS.size,
       sheetFallback: parts.usedFallbackSheet,
       sheetName: parts.sheetName
